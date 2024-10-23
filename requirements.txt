@@ -7,3 +7,7 @@ submitit
 scikit-image
 opencv-python-headless
 open_clip_torch
+opencv-python
+ninja
+torch
+tqdm
