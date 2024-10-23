@@ -41,10 +41,18 @@ class PQStatCat():
             self.fn += pq_stat_cat.fn
             return self
 
+class PQStatObjectRecognition():
+        def __init__(self):
+            # GT not found
+            self.not_found_objects_percent = 0
+            # Pred but no GT
+            self.extra_objects_percent = 0
+
 
 class PQStat():
     def __init__(self):
         self.pq_per_cat = defaultdict(PQStatCat)
+        self.obj_recogn_per_img = defaultdict(PQStatObjectRecognition)
 
     def __getitem__(self, i):
         return self.pq_per_cat[i]
@@ -53,6 +61,16 @@ class PQStat():
         for label, pq_stat_cat in pq_stat.pq_per_cat.items():
             self.pq_per_cat[label] += pq_stat_cat
         return self
+    
+    def object_detection_percentage_info(self):
+        count, not_found, extra  = 0, 0, 0
+        for _, info in self.obj_recogn_per_img:
+            not_found += info.not_found_percent
+            extra += info.extra_percent
+            count += 1
+        
+        return {"missed": not_found / count, "extra": extra, "count: ": count}
+
 
     def pq_average(self, categories, isthing):
         pq, sq, rq, n = 0, 0, 0, 0
@@ -81,51 +99,96 @@ class PQStat():
         return {'pq': pq / n, 'sq': sq / n, 'rq': rq / n, 'n': n}, per_class_results
 
 
+# Annotation set holds a pair for pred and gt annotations
 @get_traceback
 def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, categories):
     pq_stat = PQStat()
 
     idx = 0
+    # Walk through all images
     for gt_ann, pred_ann in annotation_set:
+        # Each 100 images print the progress
         if idx % 100 == 0:
             print('Core: {}, {} from {} images processed'.format(proc_id, idx, len(annotation_set)))
         idx += 1
 
+        # Load GT and prediction panoptic segmentation for one image
         pan_gt = np.array(Image.open(os.path.join(gt_folder, gt_ann['file_name'])), dtype=np.uint32)
+        # This flattens image making unique ids for each image
         pan_gt = rgb2id(pan_gt)
         pan_pred = np.array(Image.open(os.path.join(pred_folder, pred_ann['file_name'])), dtype=np.uint32)
         pan_pred = rgb2id(pan_pred)
 
+        # Make a map from segment id to segment info for both GT and prediction
         gt_segms = {el['id']: el for el in gt_ann['segments_info']}
         pred_segms = {el['id']: el for el in pred_ann['segments_info']}
 
         # predicted segments area calculation + prediction sanity checks
+
+        # Create set of all segment ids in the prediction
+        # el['id'] gives the segment id which the pixels belonging to that segment
+        # use as an identifier
+        # used to validate if there are images that are in the segment info but not in the PNG
         pred_labels_set = set(el['id'] for el in pred_ann['segments_info'])
+
+        # Gets all unique labels and their counts. For things they are unique but for stuff no
         labels, labels_cnt = np.unique(pan_pred, return_counts=True)
+
+        # For each label in the prediction validate it
         for label, label_cnt in zip(labels, labels_cnt):
+            # Labels are from the image. We want to see if they are in the segment info
+            # If not or they are void we skip or throw an error
             if label not in pred_segms:
                 if label == VOID:
+                    # pred_segms[label]['area'] = label_cnt
+                    # If I find an error try this !!!!!!
                     continue
                 raise KeyError('In the image with ID {} segment with ID {} is presented in PNG and not presented in JSON.'.format(gt_ann['image_id'], label))
+            
+            # area is how many pixels have this label
             pred_segms[label]['area'] = label_cnt
+            
+            # Update if we have seen a label
             pred_labels_set.remove(label)
+
+            # Check if the category_id is in categories taken from gt
             if pred_segms[label]['category_id'] not in categories:
                 raise KeyError('In the image with ID {} segment with ID {} has unknown category_id {}.'.format(gt_ann['image_id'], label, pred_segms[label]['category_id']))
+
+        # Check if there are any labels left in the set. Which means it is in annotation but not PNG
         if len(pred_labels_set) != 0:
             raise KeyError('In the image with ID {} the following segment IDs {} are presented in JSON and not presented in PNG.'.format(gt_ann['image_id'], list(pred_labels_set)))
 
         # confusion matrix calculation
+        # They make each pixel unique by multiplying the GT by OFFSET and adding the prediction
         pan_gt_pred = pan_gt.astype(np.uint64) * OFFSET + pan_pred.astype(np.uint64)
         gt_pred_map = {}
         labels, labels_cnt = np.unique(pan_gt_pred, return_counts=True)
         for label, intersection in zip(labels, labels_cnt):
+            # The gt_id is the label // OFFSET which is the whole part based on how we built pan_gt_pred
             gt_id = label // OFFSET
+            # Pred_id is the label % OFFSET which is the remainder part based on how we built pan_gt_pred
             pred_id = label % OFFSET
+
+            # Intersection relies on the fact that each object has a unique id
             gt_pred_map[(gt_id, pred_id)] = intersection
+        
+        # Idea: Look at the interesections such that pred_id = 0 and gt_id != 0 and the opposite
+        # I can count them and see how often that happens and print that out as a metric
+        # Do IoU maybe and check if over 0.5
+        # TP is if pred_id != 0 and gt_id != 0 and IoU > 0.5
+        # TP is if pred_id == 0 and gt_id == 0 and IoU > 0.5
+        # TN otherwise
+        # Realistically I care more for how often the model is wrong than right
+        # So maybe we can look at the FP and FN where pred_id != 0 and gt_id == 0 and the opposite . Also the IoU > 0.5 still
 
         # count all matched pairs
         gt_matched = set()
         pred_matched = set()
+
+        # For each pair of gt and pred
+        obj_count = len(gt_pred_map)
+        mislabeled = []
         for label_tuple, intersection in gt_pred_map.items():
             gt_label, pred_label = label_tuple
             if gt_label not in gt_segms:
@@ -134,19 +197,25 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                 continue
             if gt_segms[gt_label]['iscrowd'] == 1:
                 continue
-            if gt_segms[gt_label]['category_id'] != pred_segms[pred_label]['category_id']:
-                continue
 
             union = pred_segms[pred_label]['area'] + gt_segms[gt_label]['area'] - intersection - gt_pred_map.get((VOID, pred_label), 0)
             iou = intersection / union
+
+
             if iou > 0.5:
+                if gt_segms[gt_label]['category_id'] != pred_segms[pred_label]['category_id']:
+                    mislabeled += [gt_label]
+                    continue
+                # If the category_id is not the same we skip. Not in my case
                 pq_stat[gt_segms[gt_label]['category_id']].tp += 1
                 pq_stat[gt_segms[gt_label]['category_id']].iou += iou
                 gt_matched.add(gt_label)
                 pred_matched.add(pred_label)
 
-        # count false positives
+        # count false negatives
         crowd_labels_dict = {}
+        missed_obj = 0
+        total_obj = len(gt_segms)
         for gt_label, gt_info in gt_segms.items():
             if gt_label in gt_matched:
                 continue
@@ -154,21 +223,38 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
             if gt_info['iscrowd'] == 1:
                 crowd_labels_dict[gt_info['category_id']] = gt_label
                 continue
+
+            # not found
+            if gt_label not in mislabeled:
+                missed_obj += 1
+
+            # not found or not matched
             pq_stat[gt_info['category_id']].fn += 1
+        
+        pq_stat.obj_recogn_per_img[gt_ann['image_id']].not_found_objects_percent = missed_obj / total_obj
 
         # count false positives
+        extra_preds = 0
+        total_obj = len(pred_segms)
         for pred_label, pred_info in pred_segms.items():
+            # Case 1) It was matched
             if pred_label in pred_matched:
                 continue
             # intersection of the segment with VOID
             intersection = gt_pred_map.get((VOID, pred_label), 0)
+
             # plus intersection with corresponding CROWD region if it exists
             if pred_info['category_id'] in crowd_labels_dict:
                 intersection += gt_pred_map.get((crowd_labels_dict[pred_info['category_id']], pred_label), 0)
+
             # predicted segment is ignored if more than half of the segment correspond to VOID and CROWD regions
             if intersection / pred_info['area'] > 0.5:
+                extra_preds += 1
                 continue
+
             pq_stat[pred_info['category_id']].fp += 1
+        pq_stat.obj_recogn_per_img[gt_ann['image_id']].extra_objects_percent = extra_preds / total_obj
+
     print('Core: {}, all {} images processed'.format(proc_id, len(annotation_set)))
     return pq_stat
 
@@ -234,6 +320,9 @@ def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None):
 
     pq_stat = pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, categories)
 
+    print("Per image panoptic quality metrics: ")
+    print("Missed Percentages: ", pq_stat.object_detection_percentage_info())
+
     metrics = [("All", None), ("Things", True), ("Stuff", False)]
     results = {}
     for name, isthing in metrics:
@@ -251,6 +340,7 @@ def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None):
             100 * results[name]['rq'],
             results[name]['n'])
         )
+
 
     t_delta = time.time() - start_time
     print("Time elapsed: {:0.2f} seconds".format(t_delta))
