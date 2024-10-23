@@ -1,0 +1,7 @@
+*ADEChallengeData2016*
+*annotations_instance.tar*
+*__pycache__*
+*MultiScaleDeformableAttention*
+tests/preds/*
+*\.o
+*ninja*
