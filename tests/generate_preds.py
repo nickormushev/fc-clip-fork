@@ -188,8 +188,8 @@ if __name__ == "__main__":
 
     cfg = setup_cfg(args)
 
-    dataset = DatasetCatalog.get("openvocab_ade20k_panoptic_train")
-    metadata = MetadataCatalog.get("openvocab_ade20k_panoptic_train")
+    #dataset = DatasetCatalog.get("openvocab_ade20k_panoptic_train")
+    metadata = MetadataCatalog.get("openvocab_ade20k_panoptic_val")
 
     predictor = DefaultPredictor(cfg)
     predictor.set_metadata(metadata)

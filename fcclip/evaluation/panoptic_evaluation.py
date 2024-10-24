@@ -19,6 +19,7 @@ from datetime import timedelta
 from collections import defaultdict
 import argparse
 import multiprocessing
+from detectron2.utils.visualizer import ColorMode, Visualizer, random_color
 
 import PIL.Image as Image
 
@@ -44,9 +45,9 @@ class PQStatCat():
 class PQStatObjectRecognition():
         def __init__(self):
             # GT not found
-            self.not_found_objects_percent = 0
+            self.not_found_objects_percent = 0.0
             # Pred but no GT
-            self.extra_objects_percent = 0
+            self.extra_objects_percent = 0.0
 
 
 class PQStat():
@@ -60,16 +61,23 @@ class PQStat():
     def __iadd__(self, pq_stat):
         for label, pq_stat_cat in pq_stat.pq_per_cat.items():
             self.pq_per_cat[label] += pq_stat_cat
+        
+        for img_id, obj_recogn in pq_stat.obj_recogn_per_img.items():
+            self.obj_recogn_per_img[img_id] = obj_recogn
+
         return self
     
     def object_detection_percentage_info(self):
         count, not_found, extra  = 0, 0, 0
-        for _, info in self.obj_recogn_per_img:
-            not_found += info.not_found_percent
-            extra += info.extra_percent
+        for _, info in self.obj_recogn_per_img.items():
+            not_found += info.not_found_objects_percent
+            extra += info.extra_objects_percent
             count += 1
-        
-        return {"missed": not_found / count, "extra": extra, "count: ": count}
+
+        if count != 0:
+            return {"missed": not_found / count, "extra": extra / count, "count: ": count}
+        else:
+            return {"missed": 0, "extra": 0, "count: ": 0}
 
 
     def pq_average(self, categories, isthing):
@@ -117,7 +125,8 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         # This flattens image making unique ids for each image
         pan_gt = rgb2id(pan_gt)
         pan_pred = np.array(Image.open(os.path.join(pred_folder, pred_ann['file_name'])), dtype=np.uint32)
-        pan_pred = rgb2id(pan_pred)
+        # I think it is not needed since my predictions are already flat
+        # pan_pred = rgb2id(pan_pred)
 
         # Make a map from segment id to segment info for both GT and prediction
         gt_segms = {el['id']: el for el in gt_ann['segments_info']}
@@ -131,7 +140,7 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         # used to validate if there are images that are in the segment info but not in the PNG
         pred_labels_set = set(el['id'] for el in pred_ann['segments_info'])
 
-        # Gets all unique labels and their counts. For things they are unique but for stuff no
+        # Gets all unique labels and their counts. For each prediction they are unique
         labels, labels_cnt = np.unique(pan_pred, return_counts=True)
 
         # For each label in the prediction validate it
@@ -187,7 +196,6 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         pred_matched = set()
 
         # For each pair of gt and pred
-        obj_count = len(gt_pred_map)
         mislabeled = []
         for label_tuple, intersection in gt_pred_map.items():
             gt_label, pred_label = label_tuple
@@ -214,7 +222,7 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
 
         # count false negatives
         crowd_labels_dict = {}
-        missed_obj = 0
+        missed_obj = 0.0
         total_obj = len(gt_segms)
         for gt_label, gt_info in gt_segms.items():
             if gt_label in gt_matched:
@@ -231,10 +239,11 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
             # not found or not matched
             pq_stat[gt_info['category_id']].fn += 1
         
-        pq_stat.obj_recogn_per_img[gt_ann['image_id']].not_found_objects_percent = missed_obj / total_obj
+        if total_obj != 0:
+            pq_stat.obj_recogn_per_img[gt_ann['image_id']].not_found_objects_percent = missed_obj / total_obj
 
         # count false positives
-        extra_preds = 0
+        extra_preds = 0.0
         total_obj = len(pred_segms)
         for pred_label, pred_info in pred_segms.items():
             # Case 1) It was matched
@@ -253,7 +262,8 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                 continue
 
             pq_stat[pred_info['category_id']].fp += 1
-        pq_stat.obj_recogn_per_img[gt_ann['image_id']].extra_objects_percent = extra_preds / total_obj
+        if total_obj != 0:
+            pq_stat.obj_recogn_per_img[gt_ann['image_id']].extra_objects_percent = extra_preds / total_obj
 
     print('Core: {}, all {} images processed'.format(proc_id, len(annotation_set)))
     return pq_stat
@@ -361,4 +371,6 @@ if __name__ == "__main__":
                         help="Folder with prediction COCO format segmentations. \
                               Default: X if the corresponding json file is X.json")
     args = parser.parse_args()
+
+    print(os.getcwd())
     pq_compute(args.gt_json_file, args.pred_json_file, args.gt_folder, args.pred_folder)
